@@ -1,0 +1,5 @@
+--reset all requests to pending
+
+delete from VolunteerDeliveryAssignment;
+
+update foodparcelrequest set StatusId=1;
