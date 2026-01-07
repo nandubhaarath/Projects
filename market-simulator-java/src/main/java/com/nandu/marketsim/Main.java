@@ -1,28 +1,53 @@
 package com.nandu.marketsim;
 
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
 public class Main {
-    public static void main(String[] args) {
-        Simulator sim = new Simulator();
+    public static void main(String[] args) throws Exception {
 
-        // Seed liquidity at t=0ms
-        sim.schedule(0, EventType.ORDER_ARRIVAL, Order.limit("S1", Side.SELL, 10, 101, 1));
-        sim.schedule(0, EventType.ORDER_ARRIVAL, Order.limit("S2", Side.SELL,  6, 102, 2));
+        try (ConcurrentExchange ex = new ConcurrentExchange(1000)) {
+            ex.start();
 
-        // Two buyers for the same best ask price
-        // A is "sent first" (timestampNs smaller), but arrives later (higher latency)
-        sim.schedule(8, EventType.ORDER_ARRIVAL, Order.limit("A", Side.BUY, 10, 101, 3));
-        sim.schedule(2, EventType.ORDER_ARRIVAL, Order.limit("B", Side.BUY, 10, 101, 4));
+            // Seed liquidity (submit into the queue too, to keep single-writer rule)
+            ex.submit(Order.limit("S1", Side.SELL, 10, 101, 1));
+            ex.submit(Order.limit("S2", Side.SELL,  6, 102, 2));
 
-        sim.run();
+            int producerThreads = 4;
+            int ordersPerProducer = 50;
 
-        System.out.println("Timed trades:");
-        for (var tt : sim.timedTrades()) {
-            var tr = tt.trade();
-            System.out.printf("t=%dms  %d @ %d  taker=%s maker=%s%n",
-                    tt.timeMs(), tr.quantity(), tr.price(), tr.takerOrderId(), tr.makerOrderId());
+            ExecutorService producers = Executors.newFixedThreadPool(producerThreads);
+
+            for (int p = 0; p < producerThreads; p++) {
+                int producerId = p;
+                producers.submit(() -> {
+                    for (int i = 0; i < ordersPerProducer; i++) {
+                        String id = "B" + producerId + "_" + i;
+                        // each tries to buy 1 share at 101
+                        Order o = Order.limit(id, Side.BUY, 1, 101, 1000 + producerId * 100 + i);
+                        try {
+                            ex.submit(o);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                    }
+                });
+            }
+
+            producers.shutdown();
+            producers.awaitTermination(2, TimeUnit.SECONDS);
+
+            // Drain queue then stop
+            Thread.sleep(300);
+            ex.stop();
+            Thread.sleep(300);
+
+            System.out.println("Processed orders: " + ex.processedCount());
+            System.out.println("Trades executed: " + ex.trades().size());
+            System.out.printf("Avg queue wait: %.2f microseconds%n", ex.avgQueueWaitMicros());
+            System.out.println("Final book snapshot: " + ex.book().snapshotTopLevels(5));
         }
-
-        System.out.println("\nFinal book snapshot:");
-        System.out.println(sim.book().snapshotTopLevels(5));
     }
 }
