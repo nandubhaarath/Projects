@@ -1,5 +1,6 @@
 package com.nandu.marketsim;
 
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -27,8 +28,19 @@ public class ConcurrentExchange implements AutoCloseable {
     // Trades stored (simple demo). In real systems you'd stream these.
     private final CopyOnWriteArrayList<Trade> trades = new CopyOnWriteArrayList<>();
 
+    // ---- Percentile sampling (single consumer thread writes; safe) ----
+    // Dynamic array to store wait times. We compute percentiles at the end.
+    private long[] waitSamplesNs = new long[16_384];
+    private int waitSampleCount = 0;
+    private final int maxSamples; // cap memory
+
     public ConcurrentExchange(int queueCapacity) {
+        this(queueCapacity, 1_000_000); // default: up to 1M samples
+    }
+
+    public ConcurrentExchange(int queueCapacity, int maxSamples) {
         this.inbound = new ArrayBlockingQueue<>(queueCapacity);
+        this.maxSamples = Math.max(10_000, maxSamples);
     }
 
     public OrderBook book() {
@@ -69,6 +81,25 @@ public class ConcurrentExchange implements AutoCloseable {
     }
 
     /**
+     * Percentiles over recorded queue-wait samples.
+     * Call after stop/drain for stable results.
+     */
+    public Percentiles queueWaitPercentilesMicros() {
+        // We sort a copy so the internal array remains as-is
+        int n = waitSampleCount;
+        if (n == 0) return new Percentiles(0.0, 0.0, 0.0, 0);
+
+        long[] copy = Arrays.copyOf(waitSamplesNs, n);
+        Arrays.sort(copy);
+
+        double p50 = percentile(copy, 50) / 1_000.0;
+        double p95 = percentile(copy, 95) / 1_000.0;
+        double p99 = percentile(copy, 99) / 1_000.0;
+
+        return new Percentiles(p50, p95, p99, n);
+    }
+
+    /**
      * Backpressure variant: blocks if queue is full.
      */
     public void submit(Order order) throws InterruptedException {
@@ -102,8 +133,10 @@ public class ConcurrentExchange implements AutoCloseable {
 
                 long now = System.nanoTime();
                 long waitNs = now - qo.enqueuedAtNs();
+
                 totalQueueWaitNs.addAndGet(waitNs);
                 updateMax(maxQueueWaitNs, waitNs);
+                recordWaitSample(waitNs);
 
                 var ts = engine.submit(qo.order());
                 if (!ts.isEmpty()) {
@@ -123,12 +156,43 @@ public class ConcurrentExchange implements AutoCloseable {
         endNs.set(System.nanoTime());
     }
 
+    private void recordWaitSample(long waitNs) {
+        // Cap total samples to bound memory
+        if (waitSampleCount >= maxSamples) return;
+
+        // Grow array if needed (single consumer thread => safe)
+        if (waitSampleCount == waitSamplesNs.length) {
+            int newSize = Math.min(waitSamplesNs.length * 2, maxSamples);
+            waitSamplesNs = Arrays.copyOf(waitSamplesNs, newSize);
+        }
+
+        waitSamplesNs[waitSampleCount++] = waitNs;
+    }
+
     private static void updateMax(AtomicLong max, long value) {
         long prev;
         do {
             prev = max.get();
             if (value <= prev) return;
         } while (!max.compareAndSet(prev, value));
+    }
+
+    /**
+     * Percentile calculation with "nearest-rank" style indexing.
+     * For n samples sorted ascending, percentile p uses index:
+     * idx = ceil(p/100 * n) - 1 (clamped)
+     */
+    private static long percentile(long[] sorted, int p) {
+        int n = sorted.length;
+        if (n == 0) return 0;
+
+        double rank = (p / 100.0) * n;
+        int idx = (int) Math.ceil(rank) - 1;
+
+        if (idx < 0) idx = 0;
+        if (idx >= n) idx = n - 1;
+
+        return sorted[idx];
     }
 
     /**
@@ -150,4 +214,6 @@ public class ConcurrentExchange implements AutoCloseable {
             consumerExec.shutdownNow();
         }
     }
+
+    public record Percentiles(double p50Micros, double p95Micros, double p99Micros, int samples) {}
 }

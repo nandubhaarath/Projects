@@ -49,6 +49,11 @@ public class Main {
             Thread.sleep(1000);
             ex.stop();
             Thread.sleep(300);
+            var pct = ex.queueWaitPercentilesMicros();
+            System.out.printf("Queue wait p50: %.2f µs%n", pct.p50Micros());
+            System.out.printf("Queue wait p95: %.2f µs%n", pct.p95Micros());
+            System.out.printf("Queue wait p99: %.2f µs%n", pct.p99Micros());
+            System.out.println("Samples: " + pct.samples());
 
             System.out.println("Accepted: " + accepted.get());
             System.out.println("Rejected (backpressure): " + rejected.get());
