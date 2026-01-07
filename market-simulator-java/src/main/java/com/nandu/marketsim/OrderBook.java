@@ -82,6 +82,37 @@ public class OrderBook {
         }
         return out;
     }
+    public Optional<Order> pollBestAsk() {
+        return pollBest(asks);
+    }
+
+    public Optional<Order> pollBestBid() {
+        return pollBest(bids);
+    }
+
+    private static Optional<Order> pollBest(NavigableMap<Long, Deque<Order>> side) {
+        if (side.isEmpty()) return Optional.empty();
+        var bestPrice = side.firstKey();
+        var q = side.get(bestPrice);
+
+        var order = q.pollFirst(); // take FIFO head
+        if (q.isEmpty()) {
+            side.remove(bestPrice); // remove empty price level
+        }
+        return Optional.ofNullable(order);
+    }
+
+    public void addFirstAtPrice(Order order) {
+        if (order.type() != OrderType.LIMIT) {
+            throw new IllegalArgumentException("Only LIMIT orders can be placed on book");
+        }
+        var price = order.limitPrice();
+        if (price == null) throw new IllegalArgumentException("LIMIT order must have limitPrice");
+
+        NavigableMap<Long, Deque<Order>> sideMap = (order.side() == Side.BUY) ? bids : asks;
+        sideMap.computeIfAbsent(price, p -> new ArrayDeque<>()).addFirst(order);
+    }
+
 
     // ---------- Snapshot types (small, useful for debugging) ----------
 
