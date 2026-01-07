@@ -16,9 +16,15 @@ public class ConcurrentExchange implements AutoCloseable {
 
     // Metrics
     private final AtomicLong processedCount = new AtomicLong(0);
-    private final AtomicLong totalQueueWaitNs = new AtomicLong(0);
+    private final AtomicLong tradesCount = new AtomicLong(0);
 
-    // Store trades (simple approach for now)
+    private final AtomicLong totalQueueWaitNs = new AtomicLong(0);
+    private final AtomicLong maxQueueWaitNs = new AtomicLong(0);
+
+    private final AtomicLong startNs = new AtomicLong(0);
+    private final AtomicLong endNs = new AtomicLong(0);
+
+    // Trades stored (simple demo). In real systems you'd stream these.
     private final CopyOnWriteArrayList<Trade> trades = new CopyOnWriteArrayList<>();
 
     public ConcurrentExchange(int queueCapacity) {
@@ -37,22 +43,53 @@ public class ConcurrentExchange implements AutoCloseable {
         return processedCount.get();
     }
 
+    public long tradesCount() {
+        return tradesCount.get();
+    }
+
     public double avgQueueWaitMicros() {
         long count = processedCount.get();
         if (count == 0) return 0.0;
         return (totalQueueWaitNs.get() / 1_000.0) / count;
     }
 
+    public double maxQueueWaitMicros() {
+        return maxQueueWaitNs.get() / 1_000.0;
+    }
+
+    public double throughputOrdersPerSec() {
+        long end = endNs.get();
+        long start = startNs.get();
+        long count = processedCount.get();
+
+        if (start == 0 || end == 0 || end <= start) return 0.0;
+
+        double seconds = (end - start) / 1_000_000_000.0;
+        return seconds == 0.0 ? 0.0 : count / seconds;
+    }
+
     /**
-     * Producers call this to submit orders.
-     * If the queue is full, this call BLOCKS (this is backpressure).
+     * Backpressure variant: blocks if queue is full.
      */
     public void submit(Order order) throws InterruptedException {
         inbound.put(new QueuedOrder(System.nanoTime(), order));
     }
 
+    /**
+     * Backpressure variant: fails fast if queue is full.
+     * Useful to simulate HTTP 429 style behaviour.
+     */
+    public boolean trySubmit(Order order, long timeout, TimeUnit unit) throws InterruptedException {
+        return inbound.offer(new QueuedOrder(System.nanoTime(), order), timeout, unit);
+    }
+
+    public int queueSize() {
+        return inbound.size();
+    }
+
     public void start() {
         if (running.compareAndSet(false, true)) {
+            startNs.compareAndSet(0, System.nanoTime());
             consumerExec.submit(this::consumeLoop);
         }
     }
@@ -63,22 +100,35 @@ public class ConcurrentExchange implements AutoCloseable {
                 QueuedOrder qo = inbound.poll(50, TimeUnit.MILLISECONDS);
                 if (qo == null) continue;
 
-                long waitNs = System.nanoTime() - qo.enqueuedAtNs();
+                long now = System.nanoTime();
+                long waitNs = now - qo.enqueuedAtNs();
                 totalQueueWaitNs.addAndGet(waitNs);
+                updateMax(maxQueueWaitNs, waitNs);
 
                 var ts = engine.submit(qo.order());
-                trades.addAll(ts);
+                if (!ts.isEmpty()) {
+                    trades.addAll(ts);
+                    tradesCount.addAndGet(ts.size());
+                }
+
                 processedCount.incrementAndGet();
 
             } catch (InterruptedException ie) {
-                // allow graceful stop
                 Thread.currentThread().interrupt();
                 break;
             } catch (Exception ex) {
-                // In a real system you'd log and decide how to handle
                 ex.printStackTrace();
             }
         }
+        endNs.set(System.nanoTime());
+    }
+
+    private static void updateMax(AtomicLong max, long value) {
+        long prev;
+        do {
+            prev = max.get();
+            if (value <= prev) return;
+        } while (!max.compareAndSet(prev, value));
     }
 
     /**
@@ -93,7 +143,7 @@ public class ConcurrentExchange implements AutoCloseable {
         stop();
         consumerExec.shutdown();
         try {
-            consumerExec.awaitTermination(2, TimeUnit.SECONDS);
+            consumerExec.awaitTermination(3, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } finally {
