@@ -2,7 +2,6 @@ package com.nandu.marketsim;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 
 public class MatchingEngine {
 
@@ -12,7 +11,19 @@ public class MatchingEngine {
         this.book = book;
     }
 
+    /**
+     * Thread-safe submission:
+     * We execute the whole matching operation under the OrderBook lock
+     * so that checks + polls + reinserts are atomic.
+     */
     public List<Trade> submit(Order incoming) {
+        return book.withLock(() -> submitInternal(incoming));
+    }
+
+    /**
+     * Internal matching logic. Assumes OrderBook lock is already held.
+     */
+    private List<Trade> submitInternal(Order incoming) {
         if (incoming.quantity() <= 0) {
             throw new IllegalArgumentException("Incoming order must have quantity > 0");
         }
@@ -24,17 +35,24 @@ public class MatchingEngine {
         boolean isMarket = incoming.type() == OrderType.MARKET;
 
         while (remaining > 0 && crosses(incoming, isBuy, isMarket)) {
-            // Take best maker from opposite side (FIFO at best price)
-            Optional<Order> makerOpt = isBuy ? book.pollBestAsk() : book.pollBestBid();
+
+            // Take best maker from the opposite side (FIFO at best price)
+            var makerOpt = isBuy ? book.pollBestAsk() : book.pollBestBid();
             if (makerOpt.isEmpty()) break;
 
             Order maker = makerOpt.get();
 
-            long makerPrice = maker.limitPrice(); // maker is always resting LIMIT
+            // Maker is always a resting LIMIT order
+            Long makerPriceObj = maker.limitPrice();
+            if (makerPriceObj == null) {
+                throw new IllegalStateException("Resting maker order must have a limitPrice");
+            }
+            long makerPrice = makerPriceObj;
+
             long makerQty = maker.quantity();
             long fillQty = Math.min(remaining, makerQty);
 
-            // Trade price = maker price (resting order price)
+            // Trade price = maker (resting) price
             trades.add(new Trade(
                     makerPrice,
                     fillQty,
@@ -44,7 +62,8 @@ public class MatchingEngine {
 
             remaining -= fillQty;
 
-            // If maker not fully filled, put remainder back at the front (keeps time priority)
+            // If maker partially filled, reinsert remainder at the front of the same price level.
+            // This preserves time priority for the original maker.
             if (fillQty < makerQty) {
                 Order makerRemainder = Order.limit(
                         maker.orderId(),
@@ -57,33 +76,37 @@ public class MatchingEngine {
             }
         }
 
-        // If incoming is LIMIT and not fully filled, rest it on the book with remaining qty
+        // If incoming is LIMIT and not fully filled, rest the remainder on the book
         if (!isMarket && remaining > 0) {
+            Long limitPriceObj = incoming.limitPrice();
+            if (limitPriceObj == null) {
+                throw new IllegalStateException("LIMIT order must have a limitPrice");
+            }
             Order rest = Order.limit(
                     incoming.orderId(),
                     incoming.side(),
                     remaining,
-                    incoming.limitPrice(),
+                    limitPriceObj,
                     incoming.timestampNs()
             );
             book.addLimitOrder(rest);
         }
 
-        // If incoming is MARKET and remaining > 0, it just doesn't fill (book was empty)
+        // MARKET remainder simply doesn't fill (no resting)
         return trades;
     }
 
+    /**
+     * Determines whether the incoming order crosses the current top-of-book.
+     * Assumes lock held (because bestBid/bestAsk are protected).
+     */
     private boolean crosses(Order incoming, boolean isBuy, boolean isMarket) {
         if (isBuy) {
-            // BUY crosses if there is any ask and:
-            // - market order OR limitPrice >= best ask
             var bestAsk = book.bestAskPrice();
             if (bestAsk.isEmpty()) return false;
             if (isMarket) return true;
             return incoming.limitPrice() >= bestAsk.get();
         } else {
-            // SELL crosses if there is any bid and:
-            // - market order OR limitPrice <= best bid
             var bestBid = book.bestBidPrice();
             if (bestBid.isEmpty()) return false;
             if (isMarket) return true;
