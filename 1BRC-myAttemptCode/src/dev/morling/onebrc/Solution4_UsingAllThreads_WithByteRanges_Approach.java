@@ -9,7 +9,8 @@
 //Once all threads complete, their partial results are merged sequentially into a final result, which i
 // s then sorted and printed.
 //
-
+//added additional functionality so that each process and thread time to complete was measured to find out
+// which function was time intensive to improve later
 package dev.morling.onebrc;
 
 import java.io.IOException;
@@ -21,7 +22,8 @@ import java.util.ArrayList;
 import java.util.Map;
 import java.util.TreeMap;
 
-public class Solution4_UsingAllThreads_WithByteRanges_Approach {
+public class Solution4_UsingAllThreads_WithByteRanges_Approach
+{
 
     private static final String FILE = "weather_stations.csv";
 
