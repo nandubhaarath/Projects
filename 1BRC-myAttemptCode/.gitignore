@@ -28,3 +28,5 @@ bin/
 
 ### Mac OS ###
 .DS_Store
+
+weather_stations_large.csv
