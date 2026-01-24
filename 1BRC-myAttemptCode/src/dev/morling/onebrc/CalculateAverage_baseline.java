@@ -26,7 +26,7 @@ import java.util.stream.Collector;
 
 public class CalculateAverage_baseline {
 
-    private static final String FILE = "weather_stations.csv";
+    private static final String FILE = "weather_stations_small.csv";
 
     private static record Measurement(String station, double value) {
         private Measurement(String[] parts) {
